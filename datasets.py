@@ -7,11 +7,122 @@
 
 
 import os
+import io
+import csv
+import zipfile
+import os.path as osp
 from torchvision import datasets, transforms
+from torch.utils.data import Dataset
+from PIL import Image
 
 from timm.data.constants import \
     IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from timm.data import create_transform
+
+
+def parse_text_file (text_file, folder='', skips=1, drop_last=True, image_index=0, label_index=1, split_tag=","):
+    images = []
+    labels = []
+    if text_file.lower().endswith('.csv'):
+        with open(text_file, mode='r', encoding="utf-8-sig") as r:
+            reader = csv.reader(r, delimiter=split_tag)
+            for index,row in enumerate(reader):
+                if index < skips: continue
+                images.append(osp.join(folder, row[image_index]))
+                labels.append(int(row[label_index].strip()))
+    else:
+        with open(text_file, 'r', encoding='utf-8') as r:
+            for index,i in enumerate(r):
+                if (index >= skips) and split_tag in i and i.strip():
+                    row = i.split(split_tag)
+                    images.append(osp.join(folder, row[image_index]))
+                    labels.append(int(row[label_index].strip()))
+    if drop_last:
+        images.pop()
+        labels.pop()
+    return images, labels
+
+class ImageLabelDataset(Dataset):
+    def __init__(self, folder:str, text_file:str, img_folder:str, transform=None, target_transform=None, **args):
+        to_rgb      = args.get('to_rgb', True)
+        skips       = int(args.get('skips',1))
+        drop_last   = args.get('drop_last',True)
+        image_index = int(args.get('image_index', 0))
+        label_index = int(args.get('label_index', 1))
+        split_tag   = args.get('split_tag', ',')
+        text_file   = os.path.join(folder, text_file)
+        
+        self.files, self.labels = parse_text_file(text_file, img_folder, skips, drop_last, image_index, label_index, split_tag)
+        self.folder = folder
+        self.transform = transform
+        self.target_transform = target_transform
+        self.to_rgb = to_rgb
+        self.lens   = len(self.labels)
+
+    def __getitem__(self, index):
+        label = self.labels[index]
+        img = Image.open(os.path.join(self.folder, self.files[index]))
+        if self.to_rgb:
+            img = img.convert('RGB')
+        if self.transform is not None:
+            img = self.transform(img)
+        if self.target_transform is not None:
+            label = self.target_transform(label)
+        return img, label
+
+    def __len__(self):
+        return self.lens
+
+
+class ZipFileDataset(Dataset):
+    def __init__(self, folder:str, transform=None, target_transform=None, **args):
+        self.folder = folder
+        to_rgb      = args.get('to_rgb', True)
+        skips       = int(args.get('skips',1))
+        drop_last   = args.get('drop_last',True)
+        image_index = int(args.get('image_index', 0))
+        label_index = int(args.get('label_index', 1))
+        split_tag   = args.get('split_tag', '\t')
+        text_file   = os.path.join(folder, args['text_file'])
+        img_folder  = args.get('image_folder', '')
+
+        self.zipfilepath = os.path.join(folder, args['zip_file'])
+        self.files, self.labels = parse_text_file(text_file, img_folder, skips, drop_last, image_index, label_index, split_tag)
+        self.transform = transform
+        self.target_transform = target_transform
+        self.to_rgb = to_rgb
+        self.lens   = len(self.labels)
+        self.zip_reader = None
+        self.zip_namelist = []
+
+    def __getitem__(self, index):
+        img = self.get_zip_image (self.zipfilepath, self.files[index])
+        label = self.labels[index]
+        if self.to_rgb:
+            img = img.convert('RGB')
+        if self.transform is not None:
+            img = self.transform(img)
+        if self.target_transform is not None:
+            label = self.target_transform(label)
+        return img, label
+
+    def __len__(self):
+        return self.lens
+
+    def get_zip_image (self, zipfilepath, name):
+        if self.zip_reader is None:
+            self.zip_reader = zipfile.ZipFile(zipfilepath, 'r')
+            self.zip_namelist = self.zip_reader.namelist()
+        if name in self.zip_namelist:
+            data = self.zip_reader.read(name)
+            try:
+                img = Image.open(io.BytesIO(data))
+            except Exception as e:
+                print("Error, Read Image inside Zip File Fail: ", zipfilepath, name)
+                print(e)
+                random_img = np.random.rand(224, 224, 3) * 255
+                img = Image.fromarray(np.uint8(random_img))
+            return img
 
 def build_dataset(is_train, args):
     transform = build_transform(is_train, args)
@@ -40,6 +151,16 @@ def build_dataset(is_train, args):
         dataset = datasets.ImageFolder(root, transform=transform)
         nb_classes = args.nb_classes
         assert len(dataset.class_to_idx) == nb_classes
+    elif args.data_set == 'image_label':
+        root = args.data_path if is_train else args.eval_data_path
+        text = args.train_text if is_train else args.eval_text
+        folder = args.train_file if is_train else args.eval_file
+        dataset = ImageLabelDataset (root, text, folder, transform, ** vars(args))
+        nb_classes = int(args.nb_classes)
+    elif args.data_set == 'zip_label':
+        root = args.data_path if is_train else args.eval_data_path
+        dataset = ZipFileDataset (root, transform, **vars(args))
+        nb_classes = int(args.nb_classes)
     else:
         raise NotImplementedError()
     print("Number of the class = %d" % nb_classes)
